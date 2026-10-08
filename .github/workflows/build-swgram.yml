@@ -1,0 +1,86 @@
+name: build-swgram
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: DrKLO/Telegram
+          path: src
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Icons
+        run: |
+          pip install pillow numpy
+          python3 gen_icons.py
+      - name: Basic patch
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+        run: |
+          cd src
+          B=TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
+          sed -i "s|APP_ID = [0-9]*;|APP_ID = $API_ID;|" $B
+          sed -i "s|APP_HASH = \"[^\"]*\"|APP_HASH = \"$API_HASH\"|" $B
+          sed -i 's|<string name="AppName">[^<]*</string>|<string name="AppName">swgram</string>|' TMessagesProj/src/main/res/values/strings.xml
+          sed -i 's|applicationId "[^"]*"|applicationId "org.nqe.swgram"|' TMessagesProj_App/build.gradle
+          for d in ../icons/mipmap-*; do n=$(basename $d); for f in $d/*.png; do for t in $(find . -path "*res/$n/$(basename $f)"); do cp $f $t; done; done; done
+          sed -i -E 's/(MAX_ACCOUNT_DEFAULT_COUNT|MAX_ACCOUNT_COUNT) = [0-9]+;/\1 = 50;/' TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java
+          sed -i -E 's/deviceModel = Build\.MANUFACTURER[^;]*;/deviceModel = "swgram";/' TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java
+          echo "org.gradle.jvmargs=-Xmx5g" >> gradle.properties
+          git add -A
+          git -c user.email=sw@nqe -c user.name=sw commit -qm basic
+      - name: Features
+        id: feat
+        continue-on-error: true
+        run: |
+          D=src/TMessagesProj/src/main
+          mkdir -p $D/java/org/nqe/sw $D/res/drawable-nodpi
+          cp sw/*.java $D/java/org/nqe/sw/
+          cp icons_sw/*.png $D/res/drawable-nodpi/
+          python3 patch_sw.py
+      - name: Reset features if they failed
+        if: steps.feat.outcome == 'failure'
+        run: cd src && git reset -q --hard HEAD && git clean -qfd
+      - name: Recon
+        run: |
+          for p in TL_messages_readHistory TL_account_updateStatus FLAG_SECURE TL_stories_readStories maxPinnedDialogsCount dialogFiltersLimit stickersSetsLimit; do echo "=== $p"; grep -rn "$p" src --include=*.java | head -20; done > recon.txt
+          echo "=== onCreate" >> recon.txt; grep -n -A4 "void onCreate()" src/TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java | head -20 >> recon.txt
+          echo "=== sendRequest" >> recon.txt; grep -n "int sendRequest" src/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java >> recon.txt
+          echo "=== manifest" >> recon.txt; grep -n "LaunchActivity" src/TMessagesProj/src/main/AndroidManifest.xml | head -5 >> recon.txt
+      - name: Build with features
+        id: b1
+        continue-on-error: true
+        shell: bash
+        run: |
+          cd src
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+          T=$(./gradlew --no-daemon -q :TMessagesProj_App:tasks --all 2>/dev/null | grep -oE '^assemble[A-Za-z]*Debug' | grep -i afat | head -1 || true)
+          [ -z "$T" ] && T=assembleDebug
+          echo "task $T" > ../task.txt
+          ./gradlew --no-daemon $T 2>&1 | tee ../build1.log
+      - name: Fallback build without features
+        if: steps.b1.outcome == 'failure'
+        shell: bash
+        run: |
+          cd src
+          git reset -q --hard HEAD && git clean -qfd
+          T=$(cat ../task.txt | cut -d' ' -f2)
+          ./gradlew --no-daemon $T 2>&1 | tee ../build2.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs
+          path: |
+            recon.txt
+            task.txt
+            build1.log
+            build2.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: swgram-apk
+          path: src/**/*.apk
